@@ -8,7 +8,10 @@ import {
   createMockCtx,
   type MockPluginContext,
 } from "@termix-ssh/plugin-sdk/testing";
-import { createTunnelManager } from "../../src/backend/manager.js";
+import {
+  createTunnelManager,
+  retryDelayMs,
+} from "../../src/backend/manager.js";
 import type { TunnelConfig } from "../../src/backend/types.js";
 import { host, manifest, pluginDir, withHosts } from "./helpers";
 
@@ -283,5 +286,81 @@ describe("failures and stops", () => {
 
     client.emit("close");
     await vi.waitFor(() => expect(retryCounts()).toEqual([1, 1]));
+  });
+});
+
+describe("autostart tunnels outlast a host reboot", () => {
+  it("keeps retrying past maxRetries until the host answers again", async () => {
+    const { mock } = setup();
+    const tunnel = config({ autoStart: true, maxRetries: 1, retryInterval: 5 });
+    manager!.configs.set(tunnel.name, tunnel);
+    const connect = vi
+      .spyOn(mock.ctx.ssh, "connect")
+      .mockRejectedValueOnce(new Error("connect ECONNREFUSED 10.0.0.5:22"))
+      .mockRejectedValueOnce(new Error("connect EHOSTUNREACH 10.0.0.5:22"))
+      .mockRejectedValueOnce(
+        new Error("Timed out while waiting for handshake"),
+      );
+
+    await manager!.connect(tunnel);
+
+    await vi.waitFor(
+      () =>
+        expect(manager!.statuses.get(tunnel.name)?.status).toBe("connected"),
+      { timeout: 2000 },
+    );
+    expect(connect).toHaveBeenCalledTimes(4);
+  });
+
+  it("retries a remote forward refused while the old session holds the port", async () => {
+    const { mock } = setup();
+    const tunnel = config({ autoStart: true, retryInterval: 5 });
+    manager!.configs.set(tunnel.name, tunnel);
+    const connect = vi
+      .spyOn(mock.ctx.ssh, "connect")
+      .mockRejectedValueOnce(new Error("remote port forwarding failed"));
+
+    await manager!.connect(tunnel);
+
+    await vi.waitFor(() =>
+      expect(manager!.statuses.get(tunnel.name)?.status).toBe("connected"),
+    );
+    expect(connect).toHaveBeenCalledTimes(2);
+  });
+
+  it("still gives up on a tunnel that is not autostart", async () => {
+    const { mock } = setup();
+    const tunnel = config({ maxRetries: 1, retryInterval: 5 });
+    manager!.configs.set(tunnel.name, tunnel);
+    vi.spyOn(mock.ctx.ssh, "connect").mockRejectedValue(
+      new Error("connect ECONNREFUSED 10.0.0.5:22"),
+    );
+
+    await manager!.connect(tunnel);
+
+    await vi.waitFor(() =>
+      expect(manager!.statuses.get(tunnel.name)).toMatchObject({
+        status: "failed",
+        reason: expect.stringContaining("Max retries exhausted"),
+      }),
+    );
+  });
+});
+
+describe("retryDelayMs", () => {
+  it("uses the configured interval for the first maxRetries", () => {
+    expect(retryDelayMs(1, 3, 5000)).toBe(5000);
+    expect(retryDelayMs(3, 3, 5000)).toBe(5000);
+  });
+
+  it("doubles after that and stops at a minute", () => {
+    expect(retryDelayMs(4, 3, 5000)).toBe(10_000);
+    expect(retryDelayMs(5, 3, 5000)).toBe(20_000);
+    expect(retryDelayMs(7, 3, 5000)).toBe(60_000);
+    expect(retryDelayMs(500, 3, 5000)).toBe(60_000);
+  });
+
+  it("never waits less than an interval set above a minute", () => {
+    expect(retryDelayMs(10, 3, 120_000)).toBe(120_000);
   });
 });

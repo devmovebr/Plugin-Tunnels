@@ -40,6 +40,24 @@ export type TunnelStatusMap = Record<string, TunnelStatus>;
 const CONNECT_TIMEOUT_MS = 60_000;
 const MANUAL_DISCONNECT_HOLD_MS = 5_000;
 const ACCESS_CACHE_MS = 60_000;
+/** Ceiling for the backoff of an autostart tunnel past its maxRetries. */
+const MAX_RETRY_DELAY_MS = 60_000;
+
+/**
+ * Wait before retry number `retryCount`. The first maxRetries use the
+ * configured interval; an autostart tunnel keeps going after that, doubling
+ * the wait up to MAX_RETRY_DELAY_MS, so it comes back once a rebooted host
+ * does instead of giving up while the host is still booting.
+ */
+export function retryDelayMs(
+  retryCount: number,
+  maxRetries: number,
+  retryInterval: number,
+): number {
+  if (retryCount <= maxRetries) return retryInterval;
+  const doubled = retryInterval * 2 ** Math.min(retryCount - maxRetries, 16);
+  return Math.min(doubled, Math.max(MAX_RETRY_DELAY_MS, retryInterval));
+}
 
 export function errorMessage(
   error: unknown,
@@ -545,10 +563,17 @@ export function createTunnelManager(ctx: PluginContext) {
     }
 
     const maxRetries = config.maxRetries || 3;
-    const retryInterval = config.retryInterval || 5000;
     const retryCount = (retryCounters.get(name) || 0) + 1;
+    const persistent = config.autoStart === true;
+    const retryDelay = retryDelayMs(
+      retryCount,
+      persistent ? maxRetries : Infinity,
+      config.retryInterval || 5000,
+    );
+    // An autostart tunnel has no last retry, so there is no total to show.
+    const shownMaxRetries = persistent ? undefined : maxRetries;
 
-    if (retryCount > maxRetries) {
+    if (!persistent && retryCount > maxRetries) {
       log.error(`All ${maxRetries} retries failed for ${name}`);
       retryExhausted.add(name);
       retryCounters.delete(name);
@@ -566,16 +591,16 @@ export function createTunnelManager(ctx: PluginContext) {
       connected: false,
       status: CONNECTION_STATES.RETRYING,
       retryCount,
-      maxRetries,
-      nextRetryIn: retryInterval / 1000,
+      maxRetries: shownMaxRetries,
+      nextRetryIn: retryDelay / 1000,
     });
 
-    let nextRetryIn = Math.ceil(retryInterval / 1000);
+    let nextRetryIn = Math.ceil(retryDelay / 1000);
     broadcast(name, {
       connected: false,
       status: CONNECTION_STATES.WAITING,
       retryCount,
-      maxRetries,
+      maxRetries: shownMaxRetries,
       nextRetryIn,
     });
 
@@ -588,7 +613,7 @@ export function createTunnelManager(ctx: PluginContext) {
             connected: false,
             status: CONNECTION_STATES.WAITING,
             retryCount,
-            maxRetries,
+            maxRetries: shownMaxRetries,
             nextRetryIn,
           });
         }
@@ -602,7 +627,7 @@ export function createTunnelManager(ctx: PluginContext) {
         if (!manualDisconnects.has(name)) {
           void connect(config, retryCount);
         }
-      }, retryInterval),
+      }, retryDelay),
     );
   }
 
@@ -676,9 +701,12 @@ export function createTunnelManager(ctx: PluginContext) {
         });
       }
 
+      // A remote forward refused because the old session still holds the
+      // port clears once the server drops that session, so an autostart
+      // tunnel keeps trying through it.
       const shouldNotRetry =
         errorType === "AUTHENTICATION_FAILED" ||
-        errorType === "CONNECTION_FAILED" ||
+        (errorType === "CONNECTION_FAILED" && !config.autoStart) ||
         manualDisconnects.has(name) ||
         options.throwOnError === true;
       await handleDisconnect(name, config, !shouldNotRetry);
